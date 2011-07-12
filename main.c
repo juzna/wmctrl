@@ -47,6 +47,7 @@ Free Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 "  -m                   Show information about the window manager and\n" \
 "                       about the environment.\n" \
 "  -l                   List windows managed by the window manager.\n" \
+"  -W                   Display info of one window\n" \
 "  -d                   List desktops. The current desktop is marked\n" \
 "                       with an asterisk.\n" \
 "  -s <DESK>            Switch to the specified desktop.\n" \
@@ -58,6 +59,7 @@ Free Software Foundation, Inc., 675 Mass Ave, Cambridge, MA 02139, USA.
 "  -r <WIN> -t <DESK>   Move the window to the specified desktop.\n" \
 "  -r <WIN> -e <MVARG>  Resize and move the window around the desktop.\n" \
 "                       The format of the <MVARG> argument is described below.\n" \
+"  -r <WIN> -E <MVARG>  Resize and move the window in relative position\n" \
 "  -r <WIN> -b <STARG>  Change the state of the window. Using this option it's\n" \
 "                       possible for example to make the window maximized,\n" \
 "                       minimized or fullscreen. The format of the <STARG>\n" \
@@ -216,10 +218,12 @@ static gchar *get_window_class (Display *disp, Window win);
 static gchar *get_property (Display *disp, Window win, 
         Atom xa_prop_type, gchar *prop_name, unsigned long *size);
 static void init_charset(void);
-static int window_move_resize (Display *disp, Window win, char *arg);
+static int window_move_resize (Display *disp, Window win, char *arg, int is_relative);
 static int window_state (Display *disp, Window win, char *arg);
 static Window Select_Window(Display *dpy);
 static Window get_active_window(Display *dpy);
+static void print_window_info(Display *disp, Window win, int max_client_machine_len);
+static int get_window_size(Display *disp, Window win, int *x, int *y, unsigned int *w, unsigned int *h, int translate);
 
 /*}}}*/
    
@@ -264,7 +268,7 @@ int main (int argc, char **argv) { /* {{{ */
         }
     }
    
-    while ((opt = getopt(argc, argv, "FGVvhlupidmxa:r:s:c:t:w:k:o:n:g:e:b:N:I:T:R:")) != -1) {
+    while ((opt = getopt(argc, argv, "FGVvhlupidmxWa:r:s:c:t:w:k:o:n:g:e:E:b:N:I:T:R:")) != -1) {
         missing_option = 0;
         switch (opt) {
             case 'F':
@@ -296,7 +300,7 @@ int main (int argc, char **argv) { /* {{{ */
             case 'r':
                 options.param_window = optarg;
                 break; 
-            case 't': case 'e': case 'b': case 'N': case 'I': case 'T':
+            case 't': case 'e': case 'b': case 'N': case 'I': case 'T': case 'W': case 'E':
                 options.param = optarg;
                 action = opt;
                 break;
@@ -357,6 +361,7 @@ int main (int argc, char **argv) { /* {{{ */
             break;
         case 'a': case 'c': case 'R': 
         case 't': case 'e': case 'b': case 'N': case 'I': case 'T':
+        case 'W': case 'E':
             if (! options.param_window) {
                 fputs("No window was specified.\n", stderr);
                 return EXIT_FAILURE;
@@ -827,7 +832,7 @@ static gboolean wm_supports (Display *disp, const gchar *prop) {/*{{{*/
     return FALSE;
 }/*}}}*/
 
-static int window_move_resize (Display *disp, Window win, char *arg) {/*{{{*/
+static int window_move_resize (Display *disp, Window win, char *arg, int is_relative) {/*{{{*/
     signed long grav, x, y, w, h;
     unsigned long grflags;
     const char *argerr = "The -e option expects a list of comma separated integers: \"gravity,X,Y,width,height\"\n";
@@ -852,6 +857,23 @@ static int window_move_resize (Display *disp, Window win, char *arg) {/*{{{*/
     if (y != -1) grflags |= (1 << 9);
     if (w != -1) grflags |= (1 << 10);
     if (h != -1) grflags |= (1 << 11);
+    
+    
+    // Relative movement
+    if(is_relative) {
+        int ox = 0, oy = 0;
+        unsigned int ow = 0, oh = 0;
+        
+        get_window_size(disp, win, &ox, &oy, &ow, &oh, 0);
+        p_verbose("original pos: %d,%d,%d,%d\n", ox, oy, ow, oh);
+        
+        if (x != -1) x += ox;
+        if (y != -1) y += oy;
+        if (w != -1) w += ow;
+        if (h != -1) h += oh;
+        
+        p_verbose("new pos should be: %d,%d,%d,%d\n", x, y, w, h);
+    }
    
     p_verbose("grflags: %lu\n", grflags);
    
@@ -884,8 +906,9 @@ static int action_window (Display *disp, Window win, char mode) {/*{{{*/
             return close_window(disp, win);
 
         case 'e':
+        case 'E':
             /* resize/move the window around the desktop => -r -e */
-            return window_move_resize(disp, win, options.param);
+            return window_move_resize(disp, win, options.param, mode == 'E');
 
         case 'b':
             /* change state of a window => -r -b */
@@ -909,7 +932,11 @@ static int action_window (Display *disp, Window win, char mode) {/*{{{*/
         case 'N': case 'I': case 'T':
             window_set_title(disp, win, options.param, mode);
             return EXIT_SUCCESS;
-
+            
+        case 'W':
+            print_window_info(disp, win, 0);
+            break;
+            
         default:
             fprintf(stderr, "Unknown action: '%c'\n", mode);
             return EXIT_FAILURE;
@@ -1297,66 +1324,89 @@ static int list_windows (Display *disp) {/*{{{*/
     
     /* print the list */
     for (i = 0; i < client_list_size / sizeof(Window); i++) {
-        gchar *title_utf8 = get_window_title(disp, client_list[i]); /* UTF8 */
-        gchar *title_out = get_output_str(title_utf8, TRUE);
-        gchar *client_machine;
-        gchar *class_out = get_window_class(disp, client_list[i]); /* UTF8 */
-        unsigned long *pid;
-        unsigned long *desktop;
-        int x, y, junkx, junky;
-        unsigned int wwidth, wheight, bw, depth;
-        Window junkroot;
-
-        /* desktop ID */
-        if ((desktop = (unsigned long *)get_property(disp, client_list[i],
-                XA_CARDINAL, "_NET_WM_DESKTOP", NULL)) == NULL) {
-            desktop = (unsigned long *)get_property(disp, client_list[i],
-                    XA_CARDINAL, "_WIN_WORKSPACE", NULL);
-        }
-
-        /* client machine */
-        client_machine = get_property(disp, client_list[i],
-                XA_STRING, "WM_CLIENT_MACHINE", NULL);
-       
-        /* pid */
-        pid = (unsigned long *)get_property(disp, client_list[i],
-                XA_CARDINAL, "_NET_WM_PID", NULL);
-
-	    /* geometry */
-        XGetGeometry (disp, client_list[i], &junkroot, &junkx, &junky,
-                          &wwidth, &wheight, &bw, &depth);
-        XTranslateCoordinates (disp, client_list[i], junkroot, junkx, junky,
-                               &x, &y, &junkroot);
-      
-        /* special desktop ID -1 means "all desktops", so we 
-           have to convert the desktop value to signed long */
-        printf("0x%.8lx %2ld", client_list[i], 
-                desktop ? (signed long)*desktop : 0);
-        if (options.show_pid) {
-           printf(" %-6lu", pid ? *pid : 0);
-        }
-        if (options.show_geometry) {
-           printf(" %-4d %-4d %-4d %-4d", x, y, wwidth, wheight);
-        }
-		if (options.show_class) {
-		   printf(" %-20s ", class_out ? class_out : "N/A");
-		}
-
-        printf(" %*s %s\n",
-              max_client_machine_len,
-              client_machine ? client_machine : "N/A",
-              title_out ? title_out : "N/A"
-		);
-        g_free(title_utf8);
-        g_free(title_out);
-        g_free(desktop);
-        g_free(client_machine);
-        g_free(class_out);
-        g_free(pid);
+        print_window_info(disp, client_list[i], max_client_machine_len);
     }
     g_free(client_list);
    
     return EXIT_SUCCESS;
+}/*}}}*/
+
+static void print_window_info(Display *disp, Window win, int max_client_machine_len) { /*{{{*/
+	gchar *title_utf8 = get_window_title(disp, win); /* UTF8 */
+	gchar *title_out = get_output_str(title_utf8, TRUE);
+	gchar *client_machine;
+	gchar *class_out = get_window_class(disp, win); /* UTF8 */
+	unsigned long *pid;
+	unsigned long *desktop;
+	int x, y, junkx, junky;
+	unsigned int wwidth, wheight, bw, depth;
+	Window junkroot;
+
+	/* desktop ID */
+	if ((desktop = (unsigned long *)get_property(disp, win,
+			XA_CARDINAL, "_NET_WM_DESKTOP", NULL)) == NULL) {
+		desktop = (unsigned long *)get_property(disp, win,
+				XA_CARDINAL, "_WIN_WORKSPACE", NULL);
+	}
+
+	/* client machine */
+	client_machine = get_property(disp, win,
+			XA_STRING, "WM_CLIENT_MACHINE", NULL);
+   
+	/* pid */
+	pid = (unsigned long *)get_property(disp, win,
+			XA_CARDINAL, "_NET_WM_PID", NULL);
+
+	/* geometry */
+	XGetGeometry (disp, win, &junkroot, &junkx, &junky,
+					  &wwidth, &wheight, &bw, &depth);
+	XTranslateCoordinates (disp, win, junkroot, junkx, junky,
+						   &x, &y, &junkroot);
+  
+	/* special desktop ID -1 means "all desktops", so we 
+	   have to convert the desktop value to signed long */
+	printf("0x%.8lx %2ld", win, 
+			desktop ? (signed long)*desktop : 0);
+	if (options.show_pid) {
+	   printf(" %-6lu", pid ? *pid : 0);
+	}
+	if (options.show_geometry) {
+	   printf(" %-4d %-4d %-4d %-4d", x, y, wwidth, wheight);
+	}
+	if (options.show_class) {
+	   printf(" %-20s ", class_out ? class_out : "N/A");
+	}
+
+	printf(" %*s %s\n",
+		  max_client_machine_len,
+		  client_machine ? client_machine : "N/A",
+		  title_out ? title_out : "N/A"
+	);
+	g_free(title_utf8);
+	g_free(title_out);
+	g_free(desktop);
+	g_free(client_machine);
+	g_free(class_out);
+	g_free(pid);
+}/*}}}*/
+
+static int get_window_size(Display *disp, Window win, int *x, int *y, unsigned int *w, unsigned int *h, int translate) {/*{{{*/    
+    int junkx, junky;
+    unsigned int bw, depth;
+    Window junkroot;
+    
+    if(translate) {
+        XGetGeometry (disp, win, &junkroot, &junkx, &junky,
+                          w, h, &bw, &depth);
+        XTranslateCoordinates (disp, win, junkroot, junkx, junky,
+                               x, y, &junkroot);
+    }
+    else {
+        XGetGeometry (disp, win, &junkroot, x, y,
+                          w, h, &bw, &depth);
+    }
+    
+    return 0;
 }/*}}}*/
 
 static gchar *get_window_class (Display *disp, Window win) {/*{{{*/
